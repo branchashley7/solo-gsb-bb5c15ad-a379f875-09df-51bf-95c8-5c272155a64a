@@ -17,9 +17,15 @@
   超间隔或方向改变都截断区间。每个区间返回起止时间、越界方向与极值
   (below 取最低、above 取最高)。因此乱序补录的正常读数可**拆分**既有区间,
   补录的越界读数可**合并**既有区间。
+- 按位置的越界区间查询额外依据位置交接/冲正审计,把每条读数映射到其发生
+  时刻的保管位置:变更时刻起取新位置,首笔变更前取首笔变更的原位置,
+  没有任何变更取样品当前位置;同刻事件先交接后冲正,同类按明细编号升序。
+  相邻同向越界读数除间隔不超过配置值外,还要求**期间没有位置变更**才归为
+  同一段;每个段额外返回保管位置(可为 null)。
 """
 from __future__ import annotations
 
+import bisect
 import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
@@ -311,6 +317,189 @@ def get_excursions(
         max_interval_seconds=profile["max_interval_seconds"],
     )
     return s.ExcursionResponse(
+        sample_id=sample_id,
+        min_temp=profile["min_temp"],
+        max_temp=profile["max_temp"],
+        max_interval_seconds=profile["max_interval_seconds"],
+        intervals=intervals,
+    )
+
+
+# ---------------------------------------------------------------- 按位置的越界区间
+
+def _load_location_events(
+    conn: sqlite3.Connection, sample_id: str
+) -> list[dict]:
+    """读取样品全部位置变更事件(交接明细 + 冲正明细),按 UTC 时间升序。
+
+    同刻事件先交接后冲正(与位置历史倒序查询中冲正排在交接之前互为镜像),
+    同类事件按明细编号(item_id)升序;每条事件记录变更前后位置。
+    """
+    rows = conn.execute(
+        "SELECT kind, from_location, to_location, created_at, item_id FROM ("
+        " SELECT 'transfer' AS kind, i.from_location AS from_location,"
+        "  i.to_location AS to_location, i.created_at AS created_at,"
+        "  i.item_id AS item_id"
+        " FROM location_transfer_items i"
+        " JOIN location_transfers t ON t.transfer_no = i.transfer_no"
+        " WHERE i.sample_id = ?"
+        " UNION ALL"
+        " SELECT 'reversal' AS kind, i.from_location AS from_location,"
+        "  i.to_location AS to_location, i.created_at AS created_at,"
+        "  i.item_id AS item_id"
+        " FROM location_transfer_reversal_items i"
+        " JOIN location_transfer_reversals r ON r.reversal_no = i.reversal_no"
+        " WHERE i.sample_id = ?"
+        " )"
+        " ORDER BY created_at ASC,"
+        " CASE kind WHEN 'transfer' THEN 0 ELSE 1 END ASC, item_id ASC",
+        (sample_id, sample_id),
+    ).fetchall()
+    return [
+        {
+            "at": parse_utc(r["created_at"]),
+            "from_location": r["from_location"],
+            "to_location": r["to_location"],
+        }
+        for r in rows
+    ]
+
+
+def compute_location_excursions(
+    rows: list[sqlite3.Row],
+    events: list[dict],
+    *,
+    min_temp: float,
+    max_temp: float,
+    max_interval_seconds: int,
+    current_location: Optional[str],
+) -> list[s.LocationExcursionInterval]:
+    """按 UTC 时间升序扫描全部读数,结合位置变更时间线重算分位置越界区间。
+
+    读数发生时刻的保管位置:最后一笔不晚于读数时刻的变更取新位置,首笔变更
+    之前取首笔变更的原位置,没有任何变更取样品当前位置。相邻同向越界读数
+    仅在间隔 <= max_interval_seconds 且两读数之间(不含上一读数时刻、含本
+    读数时刻)没有位置变更时归为同一段;正常读数、方向改变或超间隔均截断。
+    """
+    event_times = [e["at"] for e in events]
+
+    def location_at(at: datetime) -> Optional[str]:
+        idx = bisect.bisect_right(event_times, at) - 1
+        if idx >= 0:
+            return events[idx]["to_location"]
+        if events:
+            return events[0]["from_location"]
+        return current_location
+
+    intervals: list[s.LocationExcursionInterval] = []
+    current: Optional[dict] = None
+
+    for row in rows:
+        at = parse_utc(row["measured_at_utc"])
+        value = row["temperature"]
+        location = location_at(at)
+        if value < min_temp:
+            direction = "below"
+        elif value > max_temp:
+            direction = "above"
+        else:
+            direction = None  # 正常读数截断区间
+
+        if direction is None:
+            if current is not None:
+                intervals.append(_location_interval_from(current))
+                current = None
+            continue
+
+        # 两读数之间发生位置变更(含恰在本读数时刻的变更)也截断区间
+        changed_between = False
+        if current is not None:
+            lo = bisect.bisect_right(event_times, current["last_at"])
+            hi = bisect.bisect_right(event_times, at)
+            changed_between = hi > lo
+
+        gap_ok = (
+            current is not None
+            and current["direction"] == direction
+            and not changed_between
+            and (at - current["last_at"]).total_seconds() <= max_interval_seconds
+        )
+        if not gap_ok:
+            if current is not None:
+                intervals.append(_location_interval_from(current))
+            current = {
+                "direction": direction,
+                "location": location,
+                "start_at": at,
+                "last_at": at,
+                "extreme_value": value,
+                "extreme_at": at,
+                "count": 1,
+            }
+            continue
+
+        current["last_at"] = at
+        current["count"] += 1
+        more_extreme = (
+            value < current["extreme_value"]
+            if direction == "below"
+            else value > current["extreme_value"]
+        )
+        if more_extreme:
+            current["extreme_value"] = value
+            current["extreme_at"] = at
+
+    if current is not None:
+        intervals.append(_location_interval_from(current))
+    return intervals
+
+
+def _location_interval_from(current: dict) -> s.LocationExcursionInterval:
+    return s.LocationExcursionInterval(
+        location=current["location"],
+        direction=current["direction"],
+        start_at=normalize_utc(current["start_at"]),
+        end_at=normalize_utc(current["last_at"]),
+        extreme_value=current["extreme_value"],
+        extreme_at=normalize_utc(current["extreme_at"]),
+        reading_count=current["count"],
+    )
+
+
+def get_location_excursions(
+    conn: sqlite3.Connection, sample_id: str
+) -> s.LocationExcursionResponse:
+    """依据固定配置、当前全部读数与位置交接/冲正审计实时重算分位置越界区间;
+    未登记配置抛 404。"""
+    profile = _get_profile(conn, sample_id)
+    if profile is None:
+        raise TemperatureError([_conflict(
+            "temp_profile_not_found",
+            f"样品 {sample_id} 尚未登记测温配置(允许温度上下限与最大采样间隔),"
+            "无法计算越界区间",
+            sample_id=sample_id,
+        )])
+
+    sample = conn.execute(
+        "SELECT location FROM samples WHERE sample_id = ?", (sample_id,)
+    ).fetchone()
+    current_location = sample["location"] if sample is not None else None
+
+    rows = conn.execute(
+        "SELECT measured_at_utc, temperature FROM temperature_readings"
+        " WHERE sample_id = ? ORDER BY measured_at_utc ASC, reading_id ASC",
+        (sample_id,),
+    ).fetchall()
+    events = _load_location_events(conn, sample_id)
+    intervals = compute_location_excursions(
+        rows,
+        events,
+        min_temp=profile["min_temp"],
+        max_temp=profile["max_temp"],
+        max_interval_seconds=profile["max_interval_seconds"],
+        current_location=current_location,
+    )
+    return s.LocationExcursionResponse(
         sample_id=sample_id,
         min_temp=profile["min_temp"],
         max_temp=profile["max_temp"],
