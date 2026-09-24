@@ -773,3 +773,24 @@ class ExcursionResponse(BaseModel):
     intervals: list[ExcursionInterval] = Field(
         description="越界区间,按起止时间升序;依据当前全部读数实时重算"
     )
+
+
+class LocationExcursionInterval(ExcursionInterval):
+    """带读数发生时保管位置的越界区间(位置同样实时重建,不持久化)。"""
+
+    location: Optional[str] = Field(
+        default=None,
+        description="区间内读数发生时的样品保管位置(位置变更已重建);"
+        "首笔变更前取其原位置(可为 null),没有变更则取样品当前位置",
+    )
+
+
+class LocationExcursionResponse(BaseModel):
+    sample_id: str
+    min_temp: float = Field(description="样品固定允许温度下限")
+    max_temp: float = Field(description="样品固定允许温度上限")
+    max_interval_seconds: int = Field(description="样品固定最大采样间隔(秒)")
+    intervals: list[LocationExcursionInterval] = Field(
+        description="带保管位置的越界区间,按起止时间升序;"
+        "相邻同向越界读数还须位置期间无变更(同位置)才归并"
+    )

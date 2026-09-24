@@ -70,9 +70,12 @@ app = FastAPI(
         "- 样品冷链测温:为已有样品登记固定的允许温度上下限与最大采样间隔,\n"
         "  按样品写入带时区的测温时间和值(归一化 UTC,同时刻同值重放不新增、异值冲突),\n"
         "  越界区间查询依据当前全部读数实时重算:相邻同向越界读数间隔不超过配置值归为同一区间,\n"
-        "  正常读数或超间隔截断,返回起止时间、越界方向与极值,乱序补录可合并或拆分既有区间"
+        "  正常读数或超间隔截断,返回起止时间、越界方向与极值,乱序补录可合并或拆分既有区间;\n"
+        "  带保管位置的越界区间另按位置交接/冲正审计的 UTC 落库时间重建读数发生时位置\n"
+        "  (变更时刻起取新位置、同刻先交接后冲正、同类按明细编号升序),\n"
+        "  期间发生位置变更也截断归并,按段返回位置/起止/方向/极值/读数数"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -768,3 +771,27 @@ def get_temperature_excursions(
             },
         )
     return tp.get_excursions(conn, sample_id)
+
+
+@app.get(
+    "/api/v1/samples/{sample_id}/temperature/location-excursions",
+    response_model=s.LocationExcursionResponse,
+    tags=["冷链测温"],
+    summary="带保管位置的越界区间查询:按位置交接/冲正审计 UTC 时间重建读数发生时"
+            "位置,相邻同向越界读数还须期间无位置变更(同位置)才归并",
+)
+def get_temperature_location_excursions(
+    sample_id: str,
+    conn: sqlite3.Connection = Depends(get_conn),
+) -> s.LocationExcursionResponse:
+    if conn.execute(
+        "SELECT 1 FROM samples WHERE sample_id = ?", (sample_id,)
+    ).fetchone() is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "not_found",
+                "message": f"样品 {sample_id} 不存在",
+            },
+        )
+    return tp.get_location_excursions(conn, sample_id)
